@@ -43,11 +43,202 @@ This split shows up everywhere downstream — different controllers, different w
 
 ---
 
-## 2. Architecture
+## 2. DevOps
 
-### 2.1 Backend — `payment-application`
+This section covers everything between "the source repo" and "a running production container" — pipelines, AWS services, secrets, deploys, observability. The runtime hosting picture is in §1; the application-level architecture is in §3.
 
-#### 2.1.1 Stack and layout
+### 2.1 Source — AWS CodeCommit
+
+Both apps' source is hosted in AWS CodeCommit (account `459326128614`, region `us-east-1`). Each push to a tracked branch fires a CodeBuild project via a CodeCommit trigger; CodeBuild reads the `*-codebuild-buildspec.yaml` at the repo root that matches the target environment.
+
+The Maven build profile and Docker build args are environment-dependent, so each environment has its own dedicated buildspec file rather than a single parameterised one:
+
+| App | File | Purpose |
+|---|---|---|
+| Backend | [`processing-app/payment-application/staging-codebuild-buildspec.yaml`](../processing-app/payment-application/staging-codebuild-buildspec.yaml) | Build + push staging image |
+| Backend | [`processing-app/payment-application/production-codebuild-buildspec.yaml`](../processing-app/payment-application/production-codebuild-buildspec.yaml) | Build + push production image |
+| Frontend | [`processing-app/payment-application-front/staging-front-codebuild-buildspec.yaml`](../processing-app/payment-application-front/staging-front-codebuild-buildspec.yaml) | Build + push staging image |
+| Frontend | [`processing-app/payment-application-front/production-front-codebuild-buildspec.yaml`](../processing-app/payment-application-front/production-front-codebuild-buildspec.yaml) | Build + push production image |
+
+Every buildspec emits an ECS-compatible `imagedefinitions.json` artifact, which the downstream deploy stage (CodePipeline or manual ECS service update) consumes to roll the new image into the target ECS service.
+
+```mermaid
+flowchart LR
+    Dev([Developer]) -->|git push| CC[(AWS CodeCommit)]
+    CC -->|branch trigger| CB[AWS CodeBuild project<br/>per app + env]
+    CB -->|reads| Spec[buildspec.yaml<br/>env-specific]
+    CB -->|docker build<br/>multi-stage| Img[Docker image]
+    Img -->|push| ECR[(Amazon ECR<br/>env-prefixed repo)]
+    CB -->|emits| Art[imagedefinitions.json]
+    Art --> Deploy[ECS service update<br/>CodePipeline or manual]
+    Deploy --> ECS[(Amazon ECS task<br/>running container)]
+```
+
+### 2.2 Environments
+
+Three environments are defined across the build chain — `local`, `staging`, and `production`. The first is for developer machines and uses no CI pipeline; the latter two each get a CodeBuild project per app.
+
+| | local | staging | production |
+|---|---|---|---|
+| Trigger | `mvn`/`npm` on dev machine | CodeCommit push to staging branch | CodeCommit push to prod branch |
+| Backend Maven profile | `local` (default) | `staging` | `production` |
+| Backend Docker build-arg | n/a — no Docker build | `ENVIRONMENT=staging` | `ENVIRONMENT=production` |
+| Frontend env vars | `.env.development` (localhost backend, Plaid sandbox) | Sourced from Secrets Manager `/SimplProcess/payment_application/dev:*` at buildspec time, baked into image as `REACT_APP_*` ARGs | `.env.production` + buildspec ARGs (pay.nflp.com, Plaid production) |
+| Backend ECR repo | n/a | `459326128614.dkr.ecr.us-east-1.amazonaws.com/dev/payment-application` | `459326128614.dkr.ecr.us-east-1.amazonaws.com/prod/payment-application` |
+| Frontend ECR repo | n/a | `459326128614.dkr.ecr.us-east-1.amazonaws.com/dev/payment-application-front` | `459326128614.dkr.ecr.us-east-1.amazonaws.com/prod/payment-application-front` |
+| Image tag | n/a | `latest` (mutable — each build replaces it) | Short Git SHA (immutable, traceable to commit) |
+| ECS container name in `imagedefinitions.json` | n/a | backend: `main`, frontend: `react-app` | backend: `prod-payment-app-main`, frontend: `react-app` |
+| Frontend ECR housekeeping | n/a | Deletes untagged ECR images after each push | Deletes untagged ECR images after each push |
+| Secrets at runtime | local properties files; test Stripe keys hardcoded in `custom-stripe-local.properties` | AWS Secrets Manager (paths under `/SimplProcess/payment_application/dev`) | AWS Secrets Manager (prod paths) |
+| Backend public host | `http://localhost:8080` | (configured in ECS / ALB outside the repo) | `https://pay.nflp.com` |
+| Frontend public host | `http://localhost:3000` | `testpay.nflp.com` (the non-prod hostname allowed in [`nginx.conf`](../processing-app/payment-application-front/nginx.conf)) | `pay.nflp.com` |
+
+**Naming inconsistency worth flagging**: the staging-environment buildspec is named `staging-*-buildspec.yaml` but pushes to ECR paths prefixed `dev/*`. The two terms are used interchangeably in this codebase — they refer to the same single non-prod environment.
+
+**Image tagging difference matters operationally**: staging deploys overwrite the `latest` tag, so the ECS task definition always pulls the most recent build and rollbacks require re-running an old build. Production tags are content-addressable (Git SHA), so rolling back to a prior revision is just an ECS service update pointing at the older tag — no rebuild needed.
+
+The remaining sections of this doc cover the **production** environment only — staging is scoped out for runtime/architecture purposes. The two non-prod environments are documented here in DevOps because that's where they differ most materially.
+
+### 2.3 AWS service footprint
+
+Every AWS service touched by SIMPL Pay in production, with the place in the codebase or pipeline that wires it.
+
+| Service | Purpose | Wiring |
+|---|---|---|
+| **AWS CodeCommit** | Source repo for both apps (account `459326128614`, region `us-east-1`) | Branch push triggers downstream CodeBuild |
+| **AWS CodeBuild** | Build + push container images; one project per app per environment | Reads `*-codebuild-buildspec.yaml` at the repo root |
+| **AWS CodePipeline** | Orchestrates CodeBuild → ECS deploy (pipeline definition is **not** in this repo — managed in the AWS console / a separate infra repo) | Implied by the `imagedefinitions.json` output of every buildspec — this artifact format is consumed by the CodePipeline "Amazon ECS" deploy action |
+| **Amazon ECR** | Container image registry | 4 repos: `dev/payment-application`, `dev/payment-application-front`, `prod/payment-application`, `prod/payment-application-front`. Frontend buildspec runs an explicit `aws ecr batch-delete-image` for untagged images after each push (basic lifecycle housekeeping) |
+| **Amazon ECS** | Container runtime for backend + frontend | Task container names from `imagedefinitions.json`: backend `main` (staging) / `prod-payment-app-main` (prod); frontend `react-app` (both envs) |
+| **Application Load Balancer** | Routes `pay.nflp.com` / `testpay.nflp.com` to the right ECS service; TLS termination | Not in repo — provisioned outside |
+| **Amazon Route 53** | DNS for `pay.nflp.com`, `testpay.nflp.com` | Not in repo |
+| **AWS Certificate Manager (ACM)** | TLS certs for the ALB | Not in repo |
+| **AWS Secrets Manager** | Runtime + build-time secret storage | Backend resolves at startup via AWS SDK v2. Frontend staging buildspec pulls from `/SimplProcess/payment_application/dev` at build time (see §2.4) |
+| **AWS KMS** | Encrypt-at-rest for Secrets Manager and ECR | Default AWS-managed keys (no customer-managed CMK referenced in the codebase) |
+| **Amazon SNS** | Outbound: admin 2FA SMS | `SnsSmsService` in backend, region `us-east-1`, credentials from `ADMIN_SNS_*` env vars |
+| **Amazon RDS for MySQL** | The `payment` schema (MySQL 8.0.21) | Endpoint via `DB_CONNECTION_URL` env var; instance provisioned outside repo |
+| **Amazon CloudWatch Logs** | ECS container stdout / stderr | Inferred — default ECS `awslogs` driver. Log group naming, retention, and CloudWatch alarms are not configured in the codebase |
+| **AWS IAM** | CodeBuild service role, ECS task execution role, ECS task role (the latter grants the backend access to Secrets Manager + SNS) | Not in repo — managed in AWS console or a separate IaC repo |
+| **(absent) AWS SES / SQS / SNS topics / Kinesis** | — | Outbound mail uses generic SMTP (not SES). No queue or stream service in use |
+
+```mermaid
+flowchart LR
+    subgraph Build [Build pipeline]
+        CC[(CodeCommit)] --> CB[CodeBuild]
+        CB --> ECR[(ECR)]
+        CB --> Art[imagedefinitions.json]
+        Art --> CP[CodePipeline<br/>ECS deploy action]
+    end
+    subgraph Runtime [Production runtime]
+        CP --> ECS[ECS service<br/>task definition]
+        ALB[ALB] --> ECS
+        R53[(Route 53)] --> ALB
+        ACM[ACM cert] -.attached.- ALB
+        ECS --> RDS[(RDS MySQL)]
+        ECS --> SM[(Secrets Manager)]
+        ECS --> SNS[(SNS)]
+        ECS --> CWL[(CloudWatch Logs)]
+        ECR --> ECS
+    end
+```
+
+### 2.4 Secrets management
+
+**Storage**: AWS Secrets Manager, one JSON secret per environment, organised under the `/SimplProcess/payment_application/` namespace.
+
+**Staging secret path** (from `staging-front-codebuild-buildspec.yaml`): `/SimplProcess/payment_application/dev`. Known keys:
+
+| Key | Used by |
+|---|---|
+| `APPLICATION_URL` | Frontend build → `REACT_APP_BACKEND_URL` |
+| `APPLICATION_HOST` | Frontend build → `REACT_APP_APPLICATION_HOST` (WebSocket host) |
+| `LEGAL_INFO_NMLS` | Frontend build → `REACT_APP_NMLS` |
+| `LEGAL_INFO_TERMS` | Frontend build → `REACT_APP_TERMS_URL` |
+| `LEGAL_INFO_LICENSING` | Frontend build → `REACT_APP_LICENCING_URL` |
+| `UNKNOWN_LOAN_TYPE_PHONE` | Frontend build → `REACT_APP_WORKING_PHONE` |
+| `UNKNOWN_LOAN_TYPE_EMAIL` | Frontend build → `REACT_APP_WORKING_EMAIL` |
+
+By symmetry the **production secret path** is presumably `/SimplProcess/payment_application/prod`, though the production frontend buildspec does not enumerate the keys — they're injected into the CodeBuild project as plain env vars (or pulled from a different mechanism owned outside this repo).
+
+**Backend runtime secrets** (resolved at JVM startup via AWS SDK v2): database creds (`DB_CONNECTION_URL`, `DB_USERNAME`, `DB_PASSWORD`), Stripe webhook secrets per channel (`STRIPE_WEBHOOK_SECRET_CREDIT_CARD`, `STRIPE_WEBHOOK_SECRET_ACH`), Stripe API keys per channel (`STRIPE_SECRET_*`, `STRIPE_PUBLIC_*`), Plaid (`PLAID_API_SECRET`), SNS access keys (`ADMIN_SNS_ACCESS_KEY_ID`, `ADMIN_SNS_SECRET_ACCESS_KEY`), `ADMIN_SECRET` (the `AdminKey` header value).
+
+**Frontend secrets are build-time, not runtime**: every `REACT_APP_*` is baked into the static JS bundle at `npm run build`. Rotating any of them — even just a phone number — requires a full image rebuild and ECS deploy.
+
+**KMS**: default AWS-managed keys (no customer-managed CMK referenced in the codebase). If FIPS / customer-managed-key compliance is a future requirement, this is a small change in Secrets Manager + ECR config and does not touch the app code.
+
+**Rotation**: no automated rotation is configured. Stripe / Plaid / DB credentials are rotated manually by updating the Secrets Manager value and restarting ECS tasks.
+
+### 2.5 Deploy & rollback
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Dev as Developer
+    participant CC as CodeCommit
+    participant CB as CodeBuild
+    participant ECR as ECR
+    participant CP as CodePipeline
+    participant ECS as ECS service
+    participant Old as Old task
+    participant New as New task
+
+    Dev->>CC: git push (prod branch)
+    CC->>CB: trigger build
+    CB->>CB: docker build, push to ECR
+    CB->>ECR: image:<git-sha>
+    CB->>CP: imagedefinitions.json
+    CP->>ECS: UpdateService with new task definition
+    ECS->>New: Launch new task
+    New->>New: Spring Boot startup + Liquibase migrations
+    New-->>ECS: /health returns UP (always)
+    ECS->>ECS: ALB target group health check passes
+    ECS->>Old: Drain + stop
+    Note over Old,New: Rolling deployment, default ECS<br/>(no blue/green)
+```
+
+**Forward deploy**:
+1. Commit → CodeCommit (production branch)
+2. CodeCommit trigger → CodeBuild → Docker build → push `image:<git-sha>` to ECR
+3. CodeBuild emits `imagedefinitions.json` artifact
+4. CodePipeline ECS deploy action picks it up → calls `UpdateService` with a new task-definition revision pointing at `<git-sha>`
+5. ECS launches new task(s), waits for ALB target-group health checks, drains old task(s)
+
+**Rollback**:
+- **Production**: ECS service update pointing at any prior `<git-sha>` ECR tag — no rebuild needed because tags are content-addressable
+- **Staging**: tags are mutable (`latest`), so rolling back means re-running an older CodeBuild against the older commit. There is no "previous staging image" sitting in ECR — once you push, the old one is replaced.
+
+**Database migrations**: Liquibase runs at JVM startup. Every ECS task that comes up runs through any pending changesets before serving traffic. Implications:
+- The deploy itself migrates the schema — there is no separate migration step
+- Backward-incompatible schema changes will break old tasks during the rollout window
+- Multi-replica race on the same migration is handled by Liquibase's own lock table (`databasechangeloglock`)
+- A rollback that requires reverting a schema change must be done manually against MySQL — Liquibase does not auto-rollback
+
+**Deployment cadence / approvals**: not codified in this repo. Whether CodePipeline requires manual approval before promoting to ECS, and whether there's a staging soak time, is owned outside the codebase.
+
+### 2.6 Observability footprint
+
+The operational posture is intentionally light — most of these gaps are also flagged in §6:
+
+| Channel | Status | Notes |
+|---|---|---|
+| **Container logs** | CloudWatch Logs | Default ECS `awslogs` driver assumed. Log group naming, retention, and structured-log parsing rules are not in the codebase. |
+| **Application metrics** | None | `spring-boot-starter-actuator` is on the classpath but no endpoints are exposed — `/actuator/metrics` is unreachable. No Micrometer, Prometheus, CloudWatch metrics, or custom counters. |
+| **APM / tracing** | None | No Datadog, New Relic, Sentry, OpenTelemetry, or X-Ray. |
+| **Error alerting** | SMTP only | `MailMaintainersService` emails `mail.exception.to` (`nick.skorokhod@botscrew.com, simpl@nflp.com`) on every unhandled exception. That is the only outbound alert in the system. |
+| **ALB health check** | `GET /health` | Returns a hardcoded `'status': 'UP'` — does **not** verify DB / Stripe / LendingQB connectivity. The ALB will keep traffic on a backend whose database has gone away. |
+| **Pipeline alerting** | Not in repo | CodeBuild / CodePipeline failure notifications are typically wired via CloudWatch Events + SNS topic — neither is configured in this codebase. |
+| **Audit log** | None | No DB audit table; no CloudTrail-derived report. ECS task IAM role activity is captured by CloudTrail by default at the AWS account level. |
+| **Backup / DR** | RDS default | RDS automated snapshots / PITR config is on the instance, not in this repo. No application-layer export/restore tooling. |
+
+If the team wants meaningful production visibility, the smallest practical step is to expose Actuator's `/actuator/health` (which the dependency already supports) and re-point the ALB target group at it — this would at least make ALB drain a task whose database is unreachable.
+
+---
+
+## 3. Architecture
+
+### 3.1 Backend — `payment-application`
+
+#### 3.1.1 Stack and layout
 
 From [`pom.xml`](../processing-app/payment-application/pom.xml):
 
@@ -65,7 +256,7 @@ From [`pom.xml`](../processing-app/payment-application/pom.xml):
 |---|---|
 | `stripe/` | Stripe controllers, services, webhook handler, event idempotency, event handlers, mappers |
 | `payment/` | Core payment orchestration (Spring AOP aspects) |
-| `plaid/` | Plaid SDK integration (see note in §3 — frontend has no Plaid usage; current production role unclear) |
+| `plaid/` | Plaid SDK integration (see note in §4 — frontend has no Plaid usage; current production role unclear) |
 | `lqb/` | LendingQB / MeridianLink integration: loan lookup, document upload |
 | `refund/` | Refund processing (admin-initiated) |
 | `reciept/` | Receipt rendering (Thymeleaf → Flying Saucer PDF) |
@@ -80,7 +271,7 @@ Entry point: `PaymentApplication.java` (`@SpringBootApplication`).
 
 Layering: REST controllers → services → JPA repositories → MySQL. Spring AOP aspects implement cross-cutting payment + synchronization logic. Schema is owned by Liquibase (`db/changelog/liquibase-changelog.xml`); JPA `ddl-auto=none`.
 
-#### 2.1.2 Security & auth
+#### 3.1.2 Security & auth
 
 `HttpSecurityConfig` (extends `WebSecurityConfigurerAdapter`) installs a custom filter chain.
 
@@ -114,9 +305,9 @@ Session config: `maximumSessions(-1)` (unlimited concurrent sessions per princip
 
 Public paths: `/`, `/loan-number/*`, `/admin/login/**`, `/health`, `/images/**`, `/react-app/**`, `/webhook/**`. Everything else requires authentication; `/internal/**` additionally requires `ROLE_ADMIN`. **No external IdP** (no Cognito, Auth0, SSO). **No CSRF token** — auth relies on session cookies (`credentials: include` on the SPA side).
 
-#### 2.1.3 REST API surface
+#### 3.1.3 REST API surface
 
-Auth-related endpoints handled at the filter level (`POST /admin/login`, `POST /admin/login/2fa`, `GET /loan-number/{loanNumber}`) are listed in §2.1.2.
+Auth-related endpoints handled at the filter level (`POST /admin/login`, `POST /admin/login/2fa`, `GET /loan-number/{loanNumber}`) are listed in §3.1.2.
 
 | Controller | Method | Path | Request | Response | Notes |
 |---|---|---|---|---|---|
@@ -131,7 +322,7 @@ Auth-related endpoints handled at the filter level (`POST /admin/login`, `POST /
 | `StripeController` | GET | `/stripe/payment_method` | — | `PaymentMethod` | Last-used or default method for this session. |
 | `StripeController` | GET | `/stripe/ping` | — | `PaymentStatus` | Cheap status echo for liveness. |
 | `StripeController` | GET | `/stripe/initiate_delayed_ping` | — | async `PaymentStatus` | Async ping with timeout — used by `StripePingService` for long-poll fallback when WebSocket is unavailable. |
-| `StripeWebhookController` | POST | `/webhook/stripe/charge/credit_card` | raw JSON + `Stripe-Signature` header | 200 OK | Verifies signature with `stripe.webhook.secret.credit_card`, idempotency-checks via `stripe_webhook_event`, dispatches to handler (§2.1.4). |
+| `StripeWebhookController` | POST | `/webhook/stripe/charge/credit_card` | raw JSON + `Stripe-Signature` header | 200 OK | Verifies signature with `stripe.webhook.secret.credit_card`, idempotency-checks via `stripe_webhook_event`, dispatches to handler (§3.1.4). |
 | `StripeWebhookController` | POST | `/webhook/stripe/charge/ach` | raw JSON + `Stripe-Signature` header | 200 OK | Same as above but `stripe.webhook.secret.ach`. |
 | `RefundController` | POST | `/internal/refund` | `RefundRequest` | 200 OK | Admin-only. Issues Stripe refund + updates the related `receipt_log` row. |
 | `AdminLoginController` | GET | `/admin/login/me` | (session) | `AdminMeResponse` | "Am I logged in / do I owe a 2FA code?" check used by the SPA's login page. |
@@ -140,13 +331,13 @@ Auth-related endpoints handled at the filter level (`POST /admin/login`, `POST /
 | `ReceiptLogController` | GET | `/internal/api/receipt-logs` | query: `page`, `size`, `sort`, `sortField`, `loanNumber`, `transactionStatus`, `paymentIntentId`, `chargeId`, `since`, `until` | `PagedResponseDTO<ReceiptLogListItemDTO>` | **Currently returns mock data** — admin dashboard not yet wired to the real `receipt_log` table. |
 | `ReceiptLogController` | GET | `/internal/api/receipt-logs/{id}` | path param | `ReceiptLogDetailDTO` | Same caveat — mock data. |
 
-#### 2.1.4 Stripe event handlers
+#### 3.1.4 Stripe event handlers
 
 `StripeWebhookEventHandlerService` builds a `Map<PaymentEventStatus, StripeEventHandler<?>>` at startup by collecting every `StripeEventHandler` bean and keying it by `status()`. Each handler can further filter by channel (`supports(LoanType)`).
 
 | Handler | Event(s) handled | Channel | Side effects |
 |---|---|---|---|
-| `StripeChargeSuccessEventHandlerService` | `charge.succeeded` | both | Update `PaymentSessionInfo` → `POST_PAYMENT`, update `receipt_log.transaction_status` → `PAID`, call `LoanService.uploadPdf()` → renders receipt + uploads to LendingQB (CC only — see §2.1.5) |
+| `StripeChargeSuccessEventHandlerService` | `charge.succeeded` | both | Update `PaymentSessionInfo` → `POST_PAYMENT`, update `receipt_log.transaction_status` → `PAID`, call `LoanService.uploadPdf()` → renders receipt + uploads to LendingQB (CC only — see §3.1.5) |
 | `StripeFailEventHandlerService` | `charge.failed` | both | Delegates to `FailedPaymentStripeEventHandler` |
 | `StripePendingEventHandlerService` | `charge.pending` | ACH only | `PaymentSessionInfo` → `IN_PAYMENT` |
 | `StripePaymentIntentSucceededEventHandler` | `payment_intent.succeeded` | ACH only | Mark `ach_payment_intent_draft.status` = `SUCCEEDED`, `PaymentSessionInfo` → `POST_PAYMENT`, `receipt_log` → `PAID`. Retrieves the charge via Stripe API if absent from the webhook payload. |
@@ -181,7 +372,7 @@ flowchart TD
     Unknown --> Done
 ```
 
-#### 2.1.5 Receipt generation pipeline
+#### 3.1.5 Receipt generation pipeline
 
 End-to-end, only invoked on `charge.succeeded`:
 
@@ -192,7 +383,7 @@ End-to-end, only invoked on `charge.succeeded`:
 3. The picked context builds a Thymeleaf model (loan, borrower, items, totals, charge, last-4, payment date).
 4. `templateEngine.process("thymeleaf/receipt", ctx)` renders [`templates/thymeleaf/receipt.html`](../processing-app/payment-application/src/main/resources/templates/thymeleaf/receipt.html) (template path from `custom-receipt.properties`).
 5. Flying Saucer's `ITextRenderer` converts the rendered HTML to a PDF byte array.
-6. Upload: `lqbClient.uploadPdf(loanNumber, encodedReceipt)` → LendingQB `EDocsService.UploadPDFDocumentResponse`. On failure the row is persisted to `document_info` for the scheduler (§2.1.6) to retry.
+6. Upload: `lqbClient.uploadPdf(loanNumber, encodedReceipt)` → LendingQB `EDocsService.UploadPDFDocumentResponse`. On failure the row is persisted to `document_info` for the scheduler (§3.1.6) to retry.
 
 **Two consequential omissions** in this pipeline:
 
@@ -215,7 +406,7 @@ flowchart LR
     CtxACH --> Skip([No PDF generated])
 ```
 
-#### 2.1.6 Document resend scheduler
+#### 3.1.6 Document resend scheduler
 
 | | |
 |---|---|
@@ -242,7 +433,7 @@ flowchart TD
     Log --> Wait
 ```
 
-#### 2.1.7 Feature toggles
+#### 3.1.7 Feature toggles
 
 `custom-toggles.properties` defines two Spring `@Conditional`-based toggles:
 
@@ -251,13 +442,13 @@ flowchart TD
 | `toggle.lqb.clients` | `LQB_CLIENTS` | `true` | `LqbClientImpl` — real SOAP calls to LendingQB | `LqbClientMock` — returns hardcoded XML from classpath. Production must keep this `true`. |
 | `toggle.payment.ping` | `PAYMENT_PING` | `true` | `ProductionStripeDurationService` — enforces ping rate limit; throws `RateLimitException` if interval too short | `DebugStripeDurationService` — always throws with last-ping timestamp (debug-only) |
 
-#### 2.1.8 Tests
+#### 3.1.8 Tests
 
 10 test classes under `src/test/java/com/botscrew/payment/` covering `lqb`, `reciept`, `stripe`, `mail`, `formatter` packages. **All use `@SpringBootTest(classes = PaymentApplication.class)` + `@RunWith(SpringRunner.class)` — full Spring context per test, no mocking framework, no Testcontainers, no in-memory H2.** Tests therefore exercise the real configured MySQL and (where applicable) the real LendingQB API — these are integration tests in practice, not unit tests. Spring Security test is on the classpath but unused.
 
-### 2.2 Frontend — `payment-application-front`
+### 3.2 Frontend — `payment-application-front`
 
-#### 2.2.1 Stack
+#### 3.2.1 Stack
 
 From [`package.json`](../processing-app/payment-application-front/package.json):
 
@@ -271,7 +462,7 @@ From [`package.json`](../processing-app/payment-application-front/package.json):
 
 Scripts: `dev` (`react-scripts start`), `build` (`react-scripts build`), `eject`.
 
-#### 2.2.2 Page-to-endpoint mapping
+#### 3.2.2 Page-to-endpoint mapping
 
 | Route | Component (entry) | Backend calls (REST) | WebSocket |
 |---|---|---|---|
@@ -295,7 +486,7 @@ Build-time env vars baked into the bundle via Dockerfile `ARG`s:
 | `REACT_APP_WORKING_EMAIL` | Support email (error page + footer) |
 | `REACT_APP_PLAID_ENVIRONMENT` | Defined in `.env*` but currently **no source reference** in the SPA |
 
-#### 2.2.3 `HttpService`
+#### 3.2.3 `HttpService`
 
 `src/modules/common/http/service/HttpService.ts` wraps native `fetch`. Methods: `fetch`, `fetchString`, `fetchAs<T>`. URL = `REACT_APP_BACKEND_URL + relativeUrl`. `credentials: "include"` is set on every request. **No `Authorization` header, no CSRF token** — auth piggybacks on the session cookie set by the backend.
 
@@ -303,7 +494,7 @@ Response parsing uses a chain-of-responsibility: `JsonResponseReader` → `TextR
 
 Error handling: on 3xx with `response.redirected`, extracts query params and calls `BrowserService.redirectOnParams()`. On non-2xx, reads `response.data.message`/`.error` and throws an `HttpError` with the status code. Network failures aren't caught — they propagate to the caller.
 
-#### 2.2.4 WebSocket
+#### 3.2.4 WebSocket
 
 `src/modules/websocket/service/WebSocketService.ts` uses `@stomp/stompjs` 6.
 
@@ -315,7 +506,7 @@ Error handling: on 3xx with `response.redirected`, extracts query params and cal
 | Lifecycle | `activate()` in `PaymentStateSwitch.componentDidMount()`, `deactivate()` in `componentWillUnmount()` |
 | Reconnect | Library defaults (~10-sec heartbeat, auto-reconnect on disconnect). No custom reconnect/heartbeat policy. |
 
-### 2.3 Database
+### 3.3 Database
 
 | | |
 |---|---|
@@ -463,7 +654,7 @@ Relationships in the diagram are explicit (`loan` ↔ `receipt_log` 1:1 via FK w
 
 ---
 
-## 3. External Dependencies
+## 4. External Dependencies
 
 | Service | Purpose | Integration shape | Direction |
 |---|---|---|---|
@@ -487,9 +678,9 @@ Relationships in the diagram are explicit (`loan` ↔ `receipt_log` 1:1 via FK w
 
 ---
 
-## 4. Workflow / Data Flow
+## 5. Workflow / Data Flow
 
-### 4.1 System context
+### 5.1 System context
 
 ```mermaid
 flowchart LR
@@ -505,7 +696,7 @@ flowchart LR
     BE -.->|"Plaid SDK (role unclear)"| Plaid[(Plaid)]
 ```
 
-### 4.2 Credit-card payment (CreditCardLoan / APPRAISAL_FEE_LOAN)
+### 5.2 Credit-card payment (CreditCardLoan / APPRAISAL_FEE_LOAN)
 
 ```mermaid
 sequenceDiagram
@@ -548,9 +739,9 @@ sequenceDiagram
 
 Stripe event types recognised by the webhook handler (`PaymentEventStatus`): `charge.succeeded`, `charge.failed`, `charge.pending`, `payment_intent.succeeded`, `payment_intent.processing`, `payment_intent.payment_failed`, `payment_intent.requires_action`, `payment_intent.canceled`. Anything else → `UNKNOWN` (acknowledged-and-ignored).
 
-### 4.3 ACH payment (AchLoan / INTEREST_LOAN)
+### 5.3 ACH payment (AchLoan / INTEREST_LOAN)
 
-Shape mirrors §4.2 with these differences:
+Shape mirrors §5.2 with these differences:
 
 1. **No Plaid Link on the customer side.** The SPA collects routing/account directly via the `PrePaymentAch` component and posts to `/stripe/process_payment/ach_payment_intent`. Stripe handles ACH bank validation.
 2. **PaymentIntent reuse.** A row is written to `ach_payment_intent_draft` (loan number + PI id + status + 24 h TTL via `STRIPE_ACH_DRAFT_TTL_SECONDS`) so a returning user can resume the same draft.
@@ -593,7 +784,7 @@ sequenceDiagram
     Note over BE: No PDF rendered (AchReceiptContextService disabled)
 ```
 
-### 4.4 Admin 2FA login
+### 5.4 Admin 2FA login
 
 ```mermaid
 sequenceDiagram
@@ -619,7 +810,7 @@ sequenceDiagram
     BE-->>FE: mock receipt log data (see Operational Notes 4)
 ```
 
-### 4.5 Refund
+### 5.5 Refund
 
 Admin-initiated only via `POST /internal/refund` (no customer-facing path). The controller calls Stripe's refund API, updates the related `receipt_log` row in place (there is no `refund` table), and an exception-style ops mail goes to maintainers if the call fails. No customer refund email or receipt is sent.
 
@@ -646,7 +837,7 @@ sequenceDiagram
     end
 ```
 
-### 4.6 WebSocket payment-status push
+### 5.6 WebSocket payment-status push
 
 - Endpoint `/socket` with SockJS fallback — client connects to `wss://${REACT_APP_APPLICATION_HOST}/socket/websocket`
 - Simple broker prefix `/topic`; application prefix `/app`
@@ -676,7 +867,7 @@ flowchart LR
     WS -->|callback to React state| SPA
 ```
 
-### 4.7 PaymentSessionInfo state machine
+### 5.7 PaymentSessionInfo state machine
 
 | State | Set by |
 |---|---|
@@ -704,13 +895,13 @@ stateDiagram-v2
     POST_PAYMENT --> [*] : session expires
 ```
 
-### 4.8 Document resend scheduler
+### 5.8 Document resend scheduler
 
 Runs every 5 minutes. Pulls all rows from `document_info`, partitions into batches of 3, async-uploads each to LendingQB. Successful rows are deleted. Failures stay queued indefinitely (no max retries). **Not cluster-safe** — see Operational Notes #5.
 
 ---
 
-## 5. Operational notes & caveats
+## 6. Operational notes & caveats
 
 Items worth surfacing to anyone reading this cold:
 
